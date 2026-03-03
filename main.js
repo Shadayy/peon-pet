@@ -14,6 +14,7 @@ let petVisible = true;
 const subAgentWindows = new Map(); // session_id → BrowserWindow
 const dummySessionIds = new Set(); // dev-only: protected from sync cleanup
 const MAX_SUB_AGENT_WINDOWS = 5;
+const SUB_AGENT_BASE_Y_OFFSET = 170; // px from bottom of work area to main pet
 
 // --- Character system ---
 // Canonical asset names → orc bundled filenames
@@ -89,7 +90,7 @@ function repositionSubAgentWindows() {
   let i = 0;
   for (const [, subWin] of subAgentWindows) {
     if (!subWin.isDestroyed()) {
-      const mainY = height - 170;
+      const mainY = height - SUB_AGENT_BASE_Y_OFFSET;
       subWin.setPosition(20, mainY - (i + 1) * 100);
       i++;
     }
@@ -107,7 +108,7 @@ function createSubAgentWindow(sessionId) {
     width: 100,
     height: 100,
     x: 20,
-    y: (height - 170) - (idx + 1) * 100,
+    y: (height - SUB_AGENT_BASE_Y_OFFSET) - (idx + 1) * 100,
     transparent: true,
     frame: false,
     alwaysOnTop: true,
@@ -359,9 +360,8 @@ function createWindow() {
 
   // Clean up sub-agent windows when main window closes
   win.on('closed', () => {
-    for (const [sid] of subAgentWindows) {
-      const subWin = subAgentWindows.get(sid);
-      if (subWin && !subWin.isDestroyed()) subWin.destroy();
+    for (const subWin of subAgentWindows.values()) {
+      if (!subWin.isDestroyed()) subWin.destroy();
     }
     subAgentWindows.clear();
   });
