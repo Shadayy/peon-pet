@@ -445,9 +445,11 @@ window.peonBridge.onConfig(({ size, subAgent }) => {
   // Re-apply current frame UVs to the new geometry
   setFrame(currentAnim, currentFrame);
 
-  // Remove dots from scene
+  // Remove dots from scene and release WebGL resources
   for (const mesh of dotMeshes) {
     scene.remove(mesh);
+    mesh.geometry.dispose();
+    mesh.material.dispose();
   }
 
   // Disable tooltip
