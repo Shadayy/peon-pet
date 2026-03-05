@@ -23,5 +23,8 @@
     "canvas": "^3.2.1",
     "electron": "^40.4.1",
     "jest": "^29.7.0"
+  },
+  "overrides": {
+    "boolean": "file:./patches/boolean-shim"
   }
 }

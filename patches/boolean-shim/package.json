@@ -1,0 +1,7 @@
+{
+  "name": "boolean",
+  "version": "3.2.0-shim.1",
+  "description": "Drop-in replacement for deprecated boolean package - parses values to boolean",
+  "main": "index.js",
+  "license": "MIT"
+}

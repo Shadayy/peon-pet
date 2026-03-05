@@ -67,6 +67,11 @@ Sessions are removed when Claude Code fires `SessionEnd`, or automatically after
 
 Hover over a dot to see the project folder and status. Hover anywhere on the widget to see all active project names.
 
+## Dependencies
+
+- **boolean**: Replaced with a local shim (`patches/boolean-shim`) via `overrides` so the deprecated `boolean` package is not installed. The shim matches the same API (`boolean`, `isBooleanable`).
+- **glob / inflight**: These come from **Jest** (and related packages). Jest 29 still uses `glob@7`, which depends on deprecated `inflight`. You may see npm deprecation warnings; they are harmless. Upgrading to `glob@10` would require Jest to use the new API (see [jestjs/jest#15173](https://github.com/jestjs/jest/issues/15173), [#15910](https://github.com/jestjs/jest/issues/15910)). Until Jest updates, the warnings can be ignored or suppressed.
+
 ## Development
 
 ```bash
