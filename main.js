@@ -11,6 +11,7 @@ const {
 
 let win;
 let petVisible = true;
+let lastPendingSubagentTs = 0; // tracks last seen pending_subagent_pack.ts to detect SubagentStart
 const subAgentWindows = new Map(); // session_id → BrowserWindow
 const dummySessionIds = new Set(); // dev-only: protected from sync cleanup
 const MAX_SUB_AGENT_WINDOWS = 5;
@@ -174,21 +175,25 @@ function destroySubAgentWindow(sessionId) {
 }
 
 function syncSubAgentWindows(state) {
-  const agentSessions = state.agent_sessions || [];
-  const activeIds = new Set();
+  // TTL sweep: destroy windows that have been open too long (e.g. SubagentStop never fired)
+  const now = Date.now();
+  const expired = [...subAgentCreatedAt.entries()]
+    .filter(([sid, createdAt]) => now - createdAt > SUB_AGENT_TTL_MS && !dummySessionIds.has(sid))
+    .map(([sid]) => sid);
+  for (const sid of expired) destroySubAgentWindow(sid);
 
-  // Create windows for active sub-agent sessions
-  for (const sid of agentSessions) {
-    activeIds.add(sid);
-    createSubAgentWindow(sid);
+  // Detect SubagentStart: pending_subagent_pack.ts is updated by peon.sh on each SubagentStart
+  const pendingPack = state.pending_subagent_pack;
+  if (pendingPack?.ts > lastPendingSubagentTs) {
+    lastPendingSubagentTs = pendingPack.ts;
+    createSubAgentWindow(`peon_sub_${Math.round(pendingPack.ts * 1000)}`);
   }
+}
 
-  // Destroy windows for sub-agent sessions that are no longer active
-  for (const sid of [...subAgentWindows.keys()]) {
-    if (!activeIds.has(sid) && !dummySessionIds.has(sid)) {
-      destroySubAgentWindow(sid);
-    }
-  }
+function initLastPendingSubagentTs() {
+  const state = readStateFile();
+  const ts = state?.pending_subagent_pack?.ts;
+  if (ts) lastPendingSubagentTs = ts;
 }
 
 function processStateUpdate(state, lastTs, setLastTs) {
@@ -279,12 +284,21 @@ function syncRemoteSessionsToTracker(state) {
 }
 
 function startPolling() {
+  initLastPendingSubagentTs();
   const cfg = loadPetConfig();
   const remoteUrl = cfg.remoteUrl || 'http://127.0.0.1:19998';
 
   setInterval(async () => {
     const state = readStateFile();
     if (state) syncSubAgentWindows(state);
+    // Detect SubagentStop: each Stop event (SubagentStop maps to Stop in peon.sh)
+    // destroys the oldest pseudo sub-agent window. Parent's own final Stop is a no-op.
+    if (state?.last_active?.timestamp !== lastTimestamp && state?.last_active?.event === 'Stop') {
+      const oldest = [...subAgentWindows.keys()]
+        .filter(id => id.startsWith('peon_sub_') && !dummySessionIds.has(id))
+        .sort((a, b) => (subAgentCreatedAt.get(a) || 0) - (subAgentCreatedAt.get(b) || 0))[0];
+      if (oldest) destroySubAgentWindow(oldest);
+    }
     processStateUpdate(state, lastTimestamp, (ts) => { lastTimestamp = ts; });
     syncRemoteSessionsToTracker(await readRemoteState(remoteUrl));
   }, 200);
@@ -458,7 +472,7 @@ function createWindow() {
           dummySessionIds.delete(id);
           destroySubAgentWindow(id);
         }
-      }, 20000);
+      }, 3000);
     }
   });
 }
