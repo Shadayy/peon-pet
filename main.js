@@ -1,17 +1,16 @@
 const { app, BrowserWindow, screen, Menu, protocol, net, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 const {
   isValidSessionId,
   createSessionTracker,
   buildSessionStates,
   EVENT_TO_ANIM,
 } = require('./lib/session-tracker');
+const { JsonlWatcher } = require('./lib/jsonl-watcher');
 
 let win;
 let petVisible = true;
-let lastPendingSubagentTs = 0; // tracks last seen pending_subagent_pack.ts to detect SubagentStart
 const subAgentWindows = new Map(); // session_id → BrowserWindow
 const dummySessionIds = new Set(); // dev-only: protected from sync cleanup
 const MAX_SUB_AGENT_WINDOWS = 5;
@@ -74,11 +73,6 @@ function registerCharacterProtocol() {
   return { char, assetsDir, customCharDir };
 }
 
-// Path to peon-ping state file
-const STATE_FILE = path.join(os.homedir(), '.claude', 'hooks', 'peon-ping', '.state.json');
-
-let lastTimestamp = 0;
-
 const tracker = createSessionTracker();
 const sessionCwds = new Map();  // session_id → cwd string
 const remoteSessionIds = new Set();
@@ -86,15 +80,6 @@ const remoteLastEvents = new Map();  // session_id → last event string
 const SESSION_PRUNE_MS = 10 * 60 * 1000;  // 10min — prune cold sessions
 const HOT_MS  = 30 * 1000;       // 30s  — actively working right now
 const WARM_MS = 2 * 60 * 1000;   // 2min — session open but idle
-
-function readStateFile() {
-  try {
-    const raw = fs.readFileSync(STATE_FILE, 'utf8');
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
 
 async function readRemoteState(baseUrl) {
   try {
@@ -174,80 +159,72 @@ function destroySubAgentWindow(sessionId) {
   repositionSubAgentWindows();
 }
 
-function syncSubAgentWindows(state) {
-  // TTL sweep: destroy windows that have been open too long (e.g. SubagentStop never fired)
+function sweepStaleSubAgentWindows() {
   const now = Date.now();
   const expired = [...subAgentCreatedAt.entries()]
     .filter(([sid, createdAt]) => now - createdAt > SUB_AGENT_TTL_MS && !dummySessionIds.has(sid))
     .map(([sid]) => sid);
   for (const sid of expired) destroySubAgentWindow(sid);
-
-  // Detect SubagentStart: pending_subagent_pack.ts is updated by peon.sh on each SubagentStart
-  const pendingPack = state.pending_subagent_pack;
-  if (pendingPack?.ts > lastPendingSubagentTs) {
-    lastPendingSubagentTs = pendingPack.ts;
-    createSubAgentWindow(`peon_sub_${Math.round(pendingPack.ts * 1000)}`);
-  }
 }
 
-function initLastPendingSubagentTs() {
-  const state = readStateFile();
-  const ts = state?.pending_subagent_pack?.ts;
-  if (ts) lastPendingSubagentTs = ts;
-}
-
-function processStateUpdate(state, lastTs, setLastTs) {
-  if (!state || !state.last_active) return lastTs;
-
-  const { timestamp, event, session_id, cwd } = state.last_active;
-  if (timestamp === lastTs) return lastTs;
-  setLastTs(timestamp);
+function handleSessionEvent({ sessionId, event, cwd, timestamp }) {
+  if (!isValidSessionId(sessionId)) return;
 
   const now = Date.now();
 
-  if (isValidSessionId(session_id)) {
-    if (event === 'SessionEnd') {
-      tracker.remove(session_id);
-      sessionCwds.delete(session_id);
-    } else {
-      // On SessionStart, deduplicate: if exactly one other session was seen
-      // within the last 5s, it's likely the same window transitioning to a
-      // resumed session (e.g. /resume in Claude Code) — replace it.
-      if (event === 'SessionStart') {
-        const existing = tracker.entries();
-        const isNew = !existing.some(([id]) => id === session_id);
-        if (isNew && existing.length === 1) {
-          const [oldId, oldTime] = existing[0];
-          if ((now - oldTime) < 5000) {
-            tracker.remove(oldId);
-          }
-        }
-      }
-      tracker.update(session_id, now);
-      if (cwd) sessionCwds.set(session_id, cwd);
+  // SessionCwd: just update the display name, no tracker change
+  if (event === 'SessionCwd') {
+    if (cwd) {
+      sessionCwds.set(sessionId, cwd);
+      sendSessionUpdate(now);
     }
-    tracker.prune(now - SESSION_PRUNE_MS);
-    // Keep sessionCwds in sync with tracker
-    for (const id of sessionCwds.keys()) {
-      if (!tracker.entries().some(([sid]) => sid === id)) sessionCwds.delete(id);
-    }
+    return;
   }
 
-  if (win && !win.isDestroyed()) {
-    const sessions = buildSessionStates(tracker.entries(), now, HOT_MS, WARM_MS, 10);
-    const sessionsWithCwd = sessions.map(s => ({
-      ...s,
-      cwd: sessionCwds.get(s.id) || null,
-    }));
-    win.webContents.send('session-update', { sessions: sessionsWithCwd });
+  if (event === 'SessionEnd') {
+    tracker.remove(sessionId);
+    sessionCwds.delete(sessionId);
+  } else if (event === 'SessionSeen') {
+    // File existed at startup: register with actual file mtime, no animation, no dedup
+    tracker.update(sessionId, timestamp || now);
+    if (cwd) sessionCwds.set(sessionId, cwd);
+  } else {
+    if (event === 'SessionStart') {
+      // Deduplicate /resume: if exactly one session was seen <5s ago, replace it
+      const existing = tracker.entries();
+      const isNew = !existing.some(([id]) => id === sessionId);
+      if (isNew && existing.length === 1) {
+        const [oldId, oldTime] = existing[0];
+        if ((now - oldTime) < 5000) tracker.remove(oldId);
+      }
+    }
+    tracker.update(sessionId, now);
+    if (cwd) sessionCwds.set(sessionId, cwd);
   }
+
+  tracker.prune(now - SESSION_PRUNE_MS);
+  for (const id of sessionCwds.keys()) {
+    if (!tracker.entries().some(([sid]) => sid === id)) sessionCwds.delete(id);
+  }
+
+  sendSessionUpdate(now);
 
   const anim = EVENT_TO_ANIM[event];
   if (anim && win && !win.isDestroyed()) {
     win.webContents.send('peon-event', { anim, event });
   }
+}
 
-  return timestamp;
+function sendSessionUpdate(now) {
+  if (!win || win.isDestroyed()) return;
+  const sessions = buildSessionStates(tracker.entries(), now, HOT_MS, WARM_MS, 10);
+  win.webContents.send('session-update', {
+    sessions: sessions.map(s => ({
+      ...s,
+      cwd: sessionCwds.get(s.id) || null,
+      name: sessionCwds.get(s.id) ? path.basename(sessionCwds.get(s.id)) : null,
+    })),
+  });
 }
 
 function syncRemoteSessionsToTracker(state) {
@@ -276,32 +253,30 @@ function syncRemoteSessionsToTracker(state) {
     }
   }
 
-  if (win && !win.isDestroyed()) {
-    const sessions = buildSessionStates(tracker.entries(), now, HOT_MS, WARM_MS, 10);
-    const sessionsWithCwd = sessions.map(s => ({ ...s, cwd: sessionCwds.get(s.id) || null }));
-    win.webContents.send('session-update', { sessions: sessionsWithCwd });
-  }
+  sendSessionUpdate(now);
 }
 
 function startPolling() {
-  initLastPendingSubagentTs();
   const cfg = loadPetConfig();
   const remoteUrl = cfg.remoteUrl || 'http://127.0.0.1:19998';
 
+  const watcher = new JsonlWatcher();
+
+  watcher.on('session-event', handleSessionEvent);
+
+  watcher.on('subagent-event', ({ sessionId, parentToolId, event }) => {
+    const windowId = `peon_sub_${sessionId}_${parentToolId}`;
+    if (event === 'SubagentStart') createSubAgentWindow(windowId);
+    else if (event === 'SubagentStop') destroySubAgentWindow(windowId);
+  });
+
+  watcher.start();
+
+  // Remote relay sync + TTL sweep (less frequent, not time-critical)
   setInterval(async () => {
-    const state = readStateFile();
-    if (state) syncSubAgentWindows(state);
-    // Detect SubagentStop: each Stop event (SubagentStop maps to Stop in peon.sh)
-    // destroys the oldest pseudo sub-agent window. Parent's own final Stop is a no-op.
-    if (state?.last_active?.timestamp !== lastTimestamp && state?.last_active?.event === 'Stop') {
-      const oldest = [...subAgentWindows.keys()]
-        .filter(id => id.startsWith('peon_sub_') && !dummySessionIds.has(id))
-        .sort((a, b) => (subAgentCreatedAt.get(a) || 0) - (subAgentCreatedAt.get(b) || 0))[0];
-      if (oldest) destroySubAgentWindow(oldest);
-    }
-    processStateUpdate(state, lastTimestamp, (ts) => { lastTimestamp = ts; });
+    sweepStaleSubAgentWindows();
     syncRemoteSessionsToTracker(await readRemoteState(remoteUrl));
-  }, 200);
+  }, 5000);
 }
 
 // --- Drag state ---
