@@ -277,6 +277,17 @@ function startPolling() {
 
   watcher.start();
 
+  // Heartbeat: refresh session hot/warm status so anySessionActive correctly decays.
+  // Sessions with pending tools are kept hot so the pet stays awake during long tool runs.
+  setInterval(() => {
+    if (tracker.entries().length === 0) return;
+    const now = Date.now();
+    for (const sessionId of watcher.getActiveSessionIds()) {
+      tracker.update(sessionId, now);
+    }
+    sendSessionUpdate(now);
+  }, 5000);
+
   // Remote relay sync + TTL sweep (less frequent, not time-critical)
   setInterval(async () => {
     sweepStaleSubAgentWindows();
